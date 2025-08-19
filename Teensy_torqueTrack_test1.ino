@@ -57,7 +57,7 @@ float bias_alpha           = 0.0f;     // IIR coefficient for slow bias (set in 
 const float bias_cutoff_hz = 0.5f;     // ~0.3–0.8 Hz reasonable
 
 // Bias learning gates (learn only when "near neutral")
-const float tau_ref_th     = 0.01f;    // |Tp_ref| threshold [Nm]
+const float tau_ref_th     = 0.005f;    // |Tp_ref| threshold [Nm]
 const float omega_th       = 0.1f;     // |omega| threshold [rad/s] (~5.7 deg/s)
 
 // [Nm/(rad/s)] virtual damping (start 0.00005–0.0001)
@@ -187,6 +187,7 @@ void setup() {
   bool init_conn = false;
   while (!init_conn) {
     send_current_command(38, 0, 0.0f, &init_conn, (long*)&enc1, (float*)&cur1);
+    Serial.print(" connection "); Serial.println(init_conn);
     delay(10);
   }
   for (int i = 0; i < 5; i++) {
@@ -210,9 +211,9 @@ void setup() {
 // ========================== Main loop ===============================
 void loop() {
   // Update torque reference from the profile (example: scaling by 0.5)
-  Tp_ref = refT[indexRefT] * 0.75f;
-  indexRefT++;
-  if (indexRefT >= refTsize) indexRefT = 0;
+  // Tp_ref = refT[indexRefT] * 0.75f;
+  // indexRefT++;
+  // if (indexRefT >= refTsize) indexRefT = 0;
 
   // Throttle loop a bit
   delay(10);
@@ -307,6 +308,7 @@ void timerISR() {
     // Serial.print(" Tp_meas "); Serial.print(Tp_meas,4);
     // Serial.print(" tau_bias "); Serial.print(tau_bias,4);
     // Serial.print(" cur_cmd "); Serial.println(cur_cmd,4);
+    Serial.print(" connection "); Serial.println(conn1);
     dbg_div = 0;
   }
 }
