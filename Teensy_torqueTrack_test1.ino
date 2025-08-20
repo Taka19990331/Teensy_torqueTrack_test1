@@ -33,7 +33,7 @@ const float ENC2RAD  = 2.0f * PI / 524288.0f; // [rad/count]
 
 // Identified friction parameters (tune to your plant)
 const float Tc_fric  = 0.011f;     // Coulomb friction [Nm]
-const float Ts_fric  = 0.0f;       // Static/Stribeck peak [Nm] (>= Tc_fric for breakaway)
+const float Ts_fric  = 0.000f;       // Static/Stribeck peak [Nm] (>= Tc_fric for breakaway) initially 0.0
 const float omega_s  = 0.3469f;    // Stribeck velocity [rad/s]
 const float alpha_s  = 0.444f;     // Stribeck shape factor [-]
 const float B        = 0.000111f;  // Viscous friction [Nm/(rad/s)]
@@ -45,7 +45,7 @@ const float dt              = 1.0f / control_freq_hz; // [s]
 // ========================== Feedforward-only control =================
 // Outer PI is removed. We rely on driver’s inner current loop.
 // We add: FF gain, bias learning, current rate limiting, and filtering.
-const float K_fric           = 0.9f;    // Friction FF gain (tune 0.7–1.2)
+const float K_fric         = 0.9f;    // Friction FF gain (tune 0.7–1.2)0.9
 const float I_MAX          = 1.0f;     // Current limit [A] (respect driver spec)
 const float DI_MAX         = 0.02f;    // Max current step per ISR [A/tick] (~6 A/s @300Hz)
 const float OMEGA_DB       = 0.01f;    // Deadband for sign stabilization [rad/s] 0.02 initially
@@ -70,10 +70,13 @@ float omega       = 0.0f;              // filtered velocity [rad/s]
 float omega_lpf   = 0.0f;              // LPF state
 const float omega_fc_hz = 25.0f;       // 20–30 Hz typical @300Hz
 float omega_alpha = 0.0f;              // IIR coefficient for velocity LPF
+// ========================== Outlier rejection =======================
+const float OMEGA_CAP   = 50.0f; // Physically possible limit [rad/s] 適度に
+const long  DCOUNTS_CAP = (long)((OMEGA_CAP * dt) / ENC2RAD + 0.5f); // 1周期での最大カウント
 
 // ========================== SPI comm ================================
 SPISettings settings(100000, MSBFIRST, SPI_MODE3); // 100 kHz (comment says 1 MHz max, keep 100k for safety)
-
+bool servo = true;
 bool  conn1 = false;
 volatile long  enc1 = 0;               // last raw encoder sample (from SPI)
 volatile float cur1 = 0.0f;            // last measured current [A] (from SPI)
@@ -229,14 +232,31 @@ void timerISR() {
     return;
   }
 
-  // 2) Encoder unwrap to cumulative counts
-  long d_counts = unwrapEncDelta(enc1, enc_prev_raw);
-  enc_prev_raw  = enc1;
-  enc_accum    += d_counts;
+  // // 2) Encoder unwrap to cumulative counts
+  // long d_counts = unwrapEncDelta(enc1, enc_prev_raw);
+  // enc_prev_raw  = enc1;
+  // enc_accum    += d_counts;
 
-  // 3) 3-point backward difference on unwrapped counts
-  long num_counts = (3L * enc_accum - 4L * acc_prev1 + acc_prev2);
-  float omega_raw = (num_counts * ENC2RAD) / (2.0f * dt);
+  // // 3) 3-point backward difference on unwrapped counts
+  // long num_counts = (3L * enc_accum - 4L * acc_prev1 + acc_prev2);
+  // float omega_raw = (num_counts * ENC2RAD) / (2.0f * dt);
+
+  
+  // 2) 受信したエンコーダを19bitにマスク（上位ゴミ対策）
+  long enc_now = (long)(enc1 & (ENC_MOD - 1));
+
+  // 3) アンラップ＋グリッチ除去の単純差分
+  static long enc_prev = 0;
+  if (enc_prev == 0) enc_prev = enc_now; // 初回整合
+
+  long d_counts = unwrapEncDelta(enc_now, enc_prev);
+  enc_prev = enc_now;
+
+  // 非現実ジャンプを捨てる
+  if (labs(d_counts) > DCOUNTS_CAP) d_counts = 0;
+
+  // 4) 単純差分から速度、あとはLPFで滑らかに
+  float omega_raw = (d_counts * ENC2RAD) / dt;
 
   // 4) LPF on velocity
   omega     = omega_alpha * omega_lpf + (1.0f - omega_alpha) * omega_raw;
@@ -262,7 +282,17 @@ void timerISR() {
     int sgn_ref = (Tp_ref > 0) - (Tp_ref < 0);
     sgn_w = (sgn_ref != 0) ? sgn_ref : last_sign;
   }
-  if (sgn_w != 0) last_sign = sgn_w;
+  // fix idea//
+  // if (sgn_w != 0) last_sign = sgn_w;
+
+  // if (fabsf(omega) > OMEGA_DB) {
+  // sgn_w = (omega > 0) - (omega < 0);
+  // last_sign = sgn_w;
+  // } else {
+  //   // ★Zero sign for dead area around 0 omega
+  //   sgn_w = 0;
+  // }
+  
 
   // 7) Friction estimate (Stribeck+Coulomb magnitude with stabilized sign, plus viscous)
   float Tfric = sgn_w * frictionMag(fabsf(omega)) + B * omega;
@@ -304,11 +334,14 @@ void timerISR() {
   // 13) Optional: throttle debug to ~50 Hz
   static uint16_t dbg_div = 0;
   if (++dbg_div >= 6) {
-    // Serial.print("Tp_ref "); Serial.print(Tp_ref,4);
-    // Serial.print(" Tp_meas "); Serial.print(Tp_meas,4);
-    // Serial.print(" tau_bias "); Serial.print(tau_bias,4);
-    // Serial.print(" cur_cmd "); Serial.println(cur_cmd,4);
-    Serial.print(" connection "); Serial.println(conn1);
+    //Serial.print("Tp_ref "); Serial.print(Tp_ref,4);
+    //Serial.print(" omega "); Serial.print(omega,4);
+    //Serial.print(" sgn_w "); Serial.println(sgn_w);
+    //Serial.print(" Tfric "); Serial.print(Tfric,4);
+    //Serial.print(" tau_bias "); Serial.println(tau_bias,4);
+    Serial.print(" cur_cmd "); Serial.println(cur_cmd,4);
+    //Serial.print(" cur_measured "); Serial.println(cur1,4);
+    //Serial.print(" connection "); Serial.println(conn1);
     dbg_div = 0;
   }
 }
