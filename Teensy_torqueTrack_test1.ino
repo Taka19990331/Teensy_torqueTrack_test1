@@ -232,33 +232,54 @@ void timerISR() {
     return;
   }
 
-  // // 2) Encoder unwrap to cumulative counts
-  // long d_counts = unwrapEncDelta(enc1, enc_prev_raw);
-  // enc_prev_raw  = enc1;
-  // enc_accum    += d_counts;
-
-  // // 3) 3-point backward difference on unwrapped counts
-  // long num_counts = (3L * enc_accum - 4L * acc_prev1 + acc_prev2);
-  // float omega_raw = (num_counts * ENC2RAD) / (2.0f * dt);
-
-  
-  // 2) 受信したエンコーダを19bitにマスク（上位ゴミ対策）
+  // --- 2) Mask to 19-bit (drop upper garbage) ---
   long enc_now = (long)(enc1 & (ENC_MOD - 1));
 
-  // 3) アンラップ＋グリッチ除去の単純差分
-  static long enc_prev = 0;
-  if (enc_prev == 0) enc_prev = enc_now; // 初回整合
+  // --- 3) Unwrap + glitch rejection on per-step delta ---
+  static long enc_prev_raw19 = 0;
+  if (enc_prev_raw19 == 0) enc_prev_raw19 = enc_now;  // first-time alignment
 
-  long d_counts = unwrapEncDelta(enc_now, enc_prev);
-  enc_prev = enc_now;
+  long d_counts = unwrapEncDelta(enc_now, enc_prev_raw19);
+  enc_prev_raw19 = enc_now;
 
-  // 非現実ジャンプを捨てる
+  // Reject non-physical jumps (counts per sample)
   if (labs(d_counts) > DCOUNTS_CAP) d_counts = 0;
 
-  // 4) 単純差分から速度、あとはLPFで滑らかに
-  float omega_raw = (d_counts * ENC2RAD) / dt;
+  // --- 3') Build cumulative unwrapped counts for 3-point derivative ---
+  static long long enc_accum = 0;          // use 64-bit to avoid overflow
+  enc_accum += d_counts;
 
-  // 4) LPF on velocity
+  // Keep two-step history of the cumulative counts
+  static long long acc_prev1 = 0, acc_prev2 = 0;
+  static uint8_t warmup = 0;
+
+  // --- 4) Velocity from 3-point backward difference (2nd-order accurate) ---
+  // f'(t_n) ≈ (3 f_n - 4 f_{n-1} + f_{n-2}) / (2*dt)
+  // During first 2 samples, fall back to simple difference.
+  float omega_raw;
+  if (warmup < 2) {
+    // Fallback: simple difference during warm-up
+    omega_raw = (d_counts * ENC2RAD) / dt;
+    warmup++;
+  } else {
+    long long num_counts = 3LL*enc_accum - 4LL*acc_prev1 + acc_prev2;
+    omega_raw = ((float)num_counts * ENC2RAD) / (2.0f * dt);
+  }
+
+  // Update history AFTER using current enc_accum
+  acc_prev2 = acc_prev1;
+  acc_prev1 = enc_accum;
+
+  // (Optional) Cap absurd angular velocity spikes (rad/s)
+  #ifdef OMEGA_CAP
+  if (fabsf(omega_raw) > OMEGA_CAP) {
+    // Either zero it or clamp to sign*cap (choose one)
+    // omega_raw = 0.0f;
+    omega_raw = copysignf(OMEGA_CAP, omega_raw);
+  }
+  #endif
+
+  // --- 5) Single-pole LPF on velocity to tame quantization noise ---
   omega     = omega_alpha * omega_lpf + (1.0f - omega_alpha) * omega_raw;
   omega_lpf = omega;
 
