@@ -282,17 +282,7 @@ void timerISR() {
     int sgn_ref = (Tp_ref > 0) - (Tp_ref < 0);
     sgn_w = (sgn_ref != 0) ? sgn_ref : last_sign;
   }
-  // fix idea//
-  // if (sgn_w != 0) last_sign = sgn_w;
-
-  // if (fabsf(omega) > OMEGA_DB) {
-  // sgn_w = (omega > 0) - (omega < 0);
-  // last_sign = sgn_w;
-  // } else {
-  //   // ★Zero sign for dead area around 0 omega
-  //   sgn_w = 0;
-  // }
-  
+   
 
   // 7) Friction estimate (Stribeck+Coulomb magnitude with stabilized sign, plus viscous)
   float Tfric = sgn_w * frictionMag(fabsf(omega)) + B * omega;
@@ -334,12 +324,12 @@ void timerISR() {
   // 13) Optional: throttle debug to ~50 Hz
   static uint16_t dbg_div = 0;
   if (++dbg_div >= 6) {
-    //Serial.print("Tp_ref "); Serial.print(Tp_ref,4);
-    //Serial.print(" omega "); Serial.print(omega,4);
+    //Serial.print("Tp_ref "); Serial.println(Tp_ref,4);
+    Serial.print(" omega "); Serial.println(omega,4);
     //Serial.print(" sgn_w "); Serial.println(sgn_w);
-    //Serial.print(" Tfric "); Serial.print(Tfric,4);
+    //Serial.print(" Tfric "); Serial.println(Tfric,4);
     //Serial.print(" tau_bias "); Serial.println(tau_bias,4);
-    Serial.print(" cur_cmd "); Serial.println(cur_cmd,4);
+    //Serial.print(" cur_cmd "); Serial.println(cur_cmd,4);
     //Serial.print(" cur_measured "); Serial.println(cur1,4);
     //Serial.print(" connection "); Serial.println(conn1);
     dbg_div = 0;
