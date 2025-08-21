@@ -125,10 +125,21 @@ int   refTsize  = sizeof(refT)/sizeof(refT[0]);
 volatile float Tp_ref = 0.0f;          // global torque reference [Nm]
 
 // ========================== Encoder unwrap & velocity ===============
-long enc_prev_raw  = 0;   // last raw sample [0..ENC_MOD-1]
-long enc_accum     = 0;   // unwrapped cumulative counts (could exceed 32-bit range in long runs)
-long acc_prev1     = 0;   // accum[n-1]
-long acc_prev2     = 0;   // accum[n-2]
+// Keep all velocity/unwrap state here to avoid globals and shadowing
+// Per-motor persistent state for encoder unwrap + velocity + LPF
+struct EncVelState {
+  bool      initialized = false; // run one-time alignment
+  long      prev_raw19  = 0;     // last 19-bit raw encoder sample
+  long long acc         = 0;     // unwrapped cumulative counts
+  long long acc_prev1   = 0;     // cum[n-1]
+  long long acc_prev2   = 0;     // cum[n-2]
+  uint8_t   warm        = 0;     // warm-up counter for 3-pt diff
+  float     omega_lpf   = 0.0f;  // LPF state
+  float     omega       = 0.0f;  // last filtered velocity [rad/s]
+};
+
+static EncVelState encs;  // ISR-local persistent state
+
 
 // ========================== Helpers ================================
 inline float iirAlpha(float cutoff_hz, float Ts) {
@@ -160,6 +171,7 @@ inline float gate_by_ref(float Tp_ref_abs) {
 // ========================== Prototypes =============================
 void send_current_command(int SS, bool servo_on, float current_cmd, bool* connection, long* val_enc, float* val_cur);
 void validate(byte* rx);
+inline float computeOmegaFromEnc(long enc_raw_32, float dt);
 
 // ========================== Setup ==================================
 void setup() {
@@ -198,14 +210,6 @@ void setup() {
     delay(5);
   }
 
-  // Initialize unwrap state with current reading
-  enc_prev_raw = enc1;
-  enc_accum    = 0;
-  acc_prev1    = 0;
-  acc_prev2    = 0;
-  omega        = 0.0f;
-  omega_lpf    = 0.0f;
-
   // Start control ISR
   Timer1.initialize(1000000 / control_freq_hz);
   Timer1.attachInterrupt(timerISR);
@@ -232,60 +236,17 @@ void timerISR() {
     return;
   }
 
-  // --- 2) Mask to 19-bit (drop upper garbage) ---
-  long enc_now = (long)(enc1 & (ENC_MOD - 1));
+  // Compute omega
+  float omega_raw = computeOmegaFromEnc(enc1, dt);
 
-  // --- 3) Unwrap + glitch rejection on per-step delta ---
-  static long enc_prev_raw19 = 0;
-  if (enc_prev_raw19 == 0) enc_prev_raw19 = enc_now;  // first-time alignment
-
-  long d_counts = unwrapEncDelta(enc_now, enc_prev_raw19);
-  enc_prev_raw19 = enc_now;
-
-  // Reject non-physical jumps (counts per sample)
-  if (labs(d_counts) > DCOUNTS_CAP) d_counts = 0;
-
-  // --- 3') Build cumulative unwrapped counts for 3-point derivative ---
-  static long long enc_accum = 0;          // use 64-bit to avoid overflow
-  enc_accum += d_counts;
-
-  // Keep two-step history of the cumulative counts
-  static long long acc_prev1 = 0, acc_prev2 = 0;
-  static uint8_t warmup = 0;
-
-  // --- 4) Velocity from 3-point backward difference (2nd-order accurate) ---
-  // f'(t_n) ≈ (3 f_n - 4 f_{n-1} + f_{n-2}) / (2*dt)
-  // During first 2 samples, fall back to simple difference.
-  float omega_raw;
-  if (warmup < 2) {
-    // Fallback: simple difference during warm-up
-    omega_raw = (d_counts * ENC2RAD) / dt;
-    warmup++;
-  } else {
-    long long num_counts = 3LL*enc_accum - 4LL*acc_prev1 + acc_prev2;
-    omega_raw = ((float)num_counts * ENC2RAD) / (2.0f * dt);
-  }
-
-  // Update history AFTER using current enc_accum
-  acc_prev2 = acc_prev1;
-  acc_prev1 = enc_accum;
-
-  // (Optional) Cap absurd angular velocity spikes (rad/s)
-  #ifdef OMEGA_CAP
-  if (fabsf(omega_raw) > OMEGA_CAP) {
-    // Either zero it or clamp to sign*cap (choose one)
-    // omega_raw = 0.0f;
-    omega_raw = copysignf(OMEGA_CAP, omega_raw);
-  }
-  #endif
-
-  // --- 5) Single-pole LPF on velocity to tame quantization noise ---
+  // --- 5) Low-pass filter on velocity ---
   omega     = omega_alpha * omega_lpf + (1.0f - omega_alpha) * omega_raw;
   omega_lpf = omega;
 
-  // Shift accum history
-  acc_prev2 = acc_prev1;
-  acc_prev1 = enc_accum;
+  // NOTE: ensure there is NO second history update elsewhere.
+  // Remove any leftover lines like:
+  //   acc_prev2 = acc_prev1; acc_prev1 = enc_accum;
+
 
   // 5) Measured current (light LPF for robustness in bias learning)
   static float i_meas_lpf = 0.0f;
@@ -356,6 +317,60 @@ void timerISR() {
     dbg_div = 0;
   }
 }
+
+// Compute encoder velocity using local static state (no globals)
+inline float computeOmegaFromEnc(long enc_raw_32, float dt) {
+  // --- persistent local state ---
+  static bool     initialized = false; // run init once
+  static long     prev_raw19  = 0;     // last 19-bit sample
+  static long long acc        = 0;     // unwrapped cumulative counts
+  static long long acc_prev1  = 0;     // cum[n-1]
+  static long long acc_prev2  = 0;     // cum[n-2]
+  static uint8_t  warm        = 0;     // warm-up counter for 3-pt diff
+
+  // --- sanitize raw sample to 19-bit ---
+  long enc_now = (long)(enc_raw_32 & (ENC_MOD - 1));
+
+  // --- one-time alignment ---
+  if (!initialized) {
+    prev_raw19 = enc_now;
+    acc = acc_prev1 = acc_prev2 = 0;
+    warm = 0;
+    initialized = true;
+  }
+
+  // --- unwrap one-step delta (counts) ---
+  long d_counts = unwrapEncDelta(enc_now, prev_raw19);
+  prev_raw19 = enc_now;
+
+  // reject non-physical jumps
+  if (labs(d_counts) > DCOUNTS_CAP) d_counts = 0;
+
+  // update cumulative counts
+  acc += d_counts;
+
+  // --- 3-point backward difference (2nd-order); simple diff until warm >= 2 ---
+  float omega_raw;
+  if (warm < 2) {
+    omega_raw = (d_counts * ENC2RAD) / dt;
+    warm++;
+  } else {
+    long long num_counts = 3LL*acc - 4LL*acc_prev1 + acc_prev2;
+    omega_raw = ((float)num_counts * ENC2RAD) / (2.0f * dt);
+  }
+
+  // history update (exactly once)
+  acc_prev2 = acc_prev1;
+  acc_prev1 = acc;
+
+  // optional clamp
+  #ifdef OMEGA_CAP
+  if (fabsf(omega_raw) > OMEGA_CAP) omega_raw = copysignf(OMEGA_CAP, omega_raw);
+  #endif
+
+  return omega_raw; // apply your LPF outside if you want
+}
+
 
 // ========================== SPI packet I/O ===========================
 void send_current_command(int SS, bool servo_on, float current_cmd, bool* connection, long* val_enc, float* val_cur) {
